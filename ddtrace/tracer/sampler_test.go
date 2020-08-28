@@ -500,7 +500,7 @@ func BenchmarkRulesSampler(b *testing.B) {
 		defer func() {
 			internal.SetGlobalTracer(&internal.NoopTracer{})
 		}()
-		t.traceWriter.(*agentTraceWriter).prioritySampling.readRatesJSON(ioutil.NopCloser(strings.NewReader(
+		t.prioritySampling.readRatesJSON(ioutil.NopCloser(strings.NewReader(
 			`{
                                         "rate_by_service":{
                                                 "service:obfuscate.http,env:":0.5,

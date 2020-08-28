@@ -367,7 +367,7 @@ func TestSpanModifyWhileFlushing(t *testing.T) {
 		case <-done:
 			return
 		default:
-			tracer.traceWriter.(*agentTraceWriter).flush()
+			tracer.traceWriter.flush()
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
