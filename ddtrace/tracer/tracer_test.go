@@ -954,7 +954,7 @@ func TestPushTrace(t *testing.T) {
 	}
 	assert.Len(tracer.out, payloadQueueSize)
 	log.Flush()
-	assert.True(len(tp.Lines()) >= 2)
+	assert.True(len(tp.Lines()) >= 1)
 }
 
 func TestTracerFlush(t *testing.T) {

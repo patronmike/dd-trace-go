@@ -149,6 +149,11 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 		prioritySampling: newPrioritySampler(),
 		pid:              strconv.Itoa(os.Getpid()),
 	}
+	if c.lambda {
+		t.traceWriter = newLogTraceWriter(c)
+	} else {
+		t.traceWriter = newAgentTraceWriter(c, t.prioritySampling)
+	}
 	return t
 }
 
@@ -156,11 +161,6 @@ func newTracer(opts ...StartOption) *tracer {
 	t := newUnstartedTracer(opts...)
 	c := t.config
 	t.config.statsd.Incr("datadog.tracer.started", nil, 1)
-	if t.config.lambda {
-		t.traceWriter = newLambdaTraceWriter(c)
-	} else {
-		t.traceWriter = newAgentTraceWriter(t.config, t.prioritySampling)
-	}
 	if c.runtimeMetrics {
 		log.Debug("Runtime metrics enabled.")
 		t.wg.Add(1)

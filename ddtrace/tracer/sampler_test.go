@@ -498,7 +498,6 @@ func BenchmarkRulesSampler(b *testing.B) {
 	benchmarkStartSpan := func(b *testing.B, t *tracer) {
 		internal.SetGlobalTracer(t)
 		defer func() {
-			close(t.stop)
 			internal.SetGlobalTracer(&internal.NoopTracer{})
 		}()
 		t.traceWriter.(*agentTraceWriter).prioritySampling.readRatesJSON(ioutil.NopCloser(strings.NewReader(

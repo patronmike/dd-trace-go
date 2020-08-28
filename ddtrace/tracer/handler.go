@@ -7,8 +7,9 @@ package tracer
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
+	"io"
+	"math"
 	"os"
 	"strconv"
 	"sync"
@@ -100,72 +101,114 @@ func (h *agentTraceWriter) flush() {
 	h.payload = newPayload()
 }
 
-type hexInt uint64
-
-func (i hexInt) MarshalJSON() ([]byte, error) {
-	return []byte(`"` + strconv.FormatUint(uint64(i), 16) + `"`), nil
-}
-
-type jsonSpan struct {
-	TraceID  hexInt             `json:"trace_id"`
-	SpanID   hexInt             `json:"span_id"`
-	ParentID hexInt             `json:"parent_id"`
-	Name     string             `json:"name"`
-	Resource string             `json:"resource"`
-	Error    int32              `json:"error"`
-	Meta     map[string]string  `json:"meta"`
-	Metrics  map[string]float64 `json:"metrics"`
-	Start    int64              `json:"start"`
-	Duration int64              `json:"duration"`
-	Service  string             `json:"service"`
-}
-
-type lambdaTraceWriter struct {
+type logTraceWriter struct {
 	config    *config
-	payload   bytes.Buffer
+	buf       bytes.Buffer
 	hasTraces bool
+	w         io.Writer
 }
 
-var _ traceWriter = &lambdaTraceWriter{}
+var _ traceWriter = &logTraceWriter{}
 
-func newLambdaTraceWriter(c *config) *lambdaTraceWriter {
-	w := &lambdaTraceWriter{
+func newLogTraceWriter(c *config) *logTraceWriter {
+	w := &logTraceWriter{
 		config: c,
+		w:      os.Stdout,
 	}
 	w.resetPayload()
 	return w
 }
 
-const payloadLimit = 256 * 1024 // log line limit for cloudwatch
+const (
+	// maxFloatLength is the maximum length that a string encoded by encodeFloat can be.
+	// At 1e21 and beyond, floats are encoded to strings in exponential format. The longest
+	// a string encoded by encodeFloat can be is 22 characters.
+	maxFloatLength = 22
 
-func (h *lambdaTraceWriter) resetPayload() {
-	h.payload.Reset()
-	h.payload.WriteString(`{"traces": [`)
+	// suffix is the final string that the trace writer has to append to a payload to close
+	// the JSON.
+	logPayloadSuffix = "]}\n"
+
+	// logPayloadLimit is the maximum size log line allowed by cloudwatch
+	logPayloadLimit = 256 * 1024
+)
+
+func (h *logTraceWriter) resetPayload() {
+	h.buf.Reset()
+	h.buf.WriteString(`{"traces": [`)
 	h.hasTraces = false
 }
 
-func (h *lambdaTraceWriter) addSpan(s *span) error {
-	js := jsonSpan{
-		TraceID:  hexInt(s.TraceID),
-		SpanID:   hexInt(s.SpanID),
-		ParentID: hexInt(s.ParentID),
-		Name:     s.Name,
-		Resource: s.Resource,
-		Error:    s.Error,
-		Meta:     s.Meta,
-		Metrics:  s.Metrics,
-		Start:    s.Start,
-		Duration: s.Duration,
-		Service:  s.Service,
+// encodeFloat correctly encodes float64 to the format enforced by ES6
+func encodeFloat(p []byte, f float64) []byte {
+	if math.IsInf(f, -1) {
+		return append(p, "-Infinity"...)
+	} else if math.IsInf(f, 1) {
+		return append(p, "Infinity"...)
 	}
-	e := json.NewEncoder(&h.payload)
-	err := e.Encode(js)
-	if err != nil {
-		return err
+	abs := math.Abs(f)
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		p = strconv.AppendFloat(p, f, 'e', -1, 64)
+		// clean up e-09 to e-9
+		n := len(p)
+		if n >= 4 && p[n-4] == 'e' && p[n-3] == '-' && p[n-2] == '0' {
+			p[n-2] = p[n-1]
+			p = p[:n-1]
+		}
+	} else {
+		p = strconv.AppendFloat(p, f, 'f', -1, 64)
 	}
-	// cut trailing newline
-	h.payload.Truncate(h.payload.Len() - 1)
-	return nil
+	return p
+}
+
+func (h *logTraceWriter) encodeSpan(s *span) {
+	var scratch [maxFloatLength]byte
+	h.buf.WriteString(`{"trace_id":"`)
+	h.buf.Write(strconv.AppendUint(scratch[:0], uint64(s.TraceID), 16))
+	h.buf.WriteString(`","span_id":"`)
+	h.buf.Write(strconv.AppendUint(scratch[:0], uint64(s.SpanID), 16))
+	h.buf.WriteString(`","parent_id":"`)
+	h.buf.Write(strconv.AppendUint(scratch[:0], uint64(s.ParentID), 16))
+	h.buf.WriteString(`","name":"`)
+	h.buf.WriteString(s.Name)
+	h.buf.WriteString(`","resource":"`)
+	h.buf.WriteString(s.Resource)
+	h.buf.WriteString(`","error":`)
+	h.buf.Write(strconv.AppendInt(scratch[:0], int64(s.Error), 10))
+	h.buf.WriteString(`,"meta":{`)
+	first := true
+	for k, v := range s.Meta {
+		if first {
+			h.buf.WriteByte('"')
+			first = false
+		} else {
+			h.buf.WriteString(`,"`)
+		}
+		h.buf.WriteString(k)
+		h.buf.WriteString(`":"`)
+		h.buf.WriteString(v)
+		h.buf.WriteString(`"`)
+	}
+	h.buf.WriteString(`},"metrics":{`)
+	first = true
+	for k, v := range s.Metrics {
+		if first {
+			h.buf.WriteByte('"')
+			first = false
+		} else {
+			h.buf.WriteString(`,"`)
+		}
+		h.buf.WriteString(k)
+		h.buf.WriteString(`":`)
+		h.buf.Write(encodeFloat(scratch[:0], v))
+	}
+	h.buf.WriteString(`},"start":`)
+	h.buf.Write(strconv.AppendInt(scratch[:0], s.Start, 10))
+	h.buf.WriteString(`,"duration":`)
+	h.buf.Write(strconv.AppendInt(scratch[:0], s.Duration, 10))
+	h.buf.WriteString(`,"service":"`)
+	h.buf.WriteString(s.Service)
+	h.buf.WriteString(`"}`)
 }
 
 type encodingError struct {
@@ -173,63 +216,62 @@ type encodingError struct {
 	dropReason string
 }
 
-func (h *lambdaTraceWriter) addTrace(trace []*span) (int, *encodingError) {
-	startLen := h.payload.Len()
+func (h *logTraceWriter) writeTrace(trace []*span) (n int, err *encodingError) {
+	startn := h.buf.Len()
 	if !h.hasTraces {
-		h.payload.WriteByte('[')
+		h.buf.WriteByte('[')
 	} else {
-		h.payload.WriteString(", [")
+		h.buf.WriteString(", [")
 	}
 	written := 0
 	for i, s := range trace {
-		l := h.payload.Len()
-		if i != 0 {
-			h.payload.WriteByte(',')
+		n := h.buf.Len()
+		if i > 0 {
+			h.buf.WriteByte(',')
 		}
-		err := h.addSpan(s)
-		if err != nil {
-			h.payload.Truncate(startLen)
-			return 0, &encodingError{cause: err, dropReason: "encoding_failed"}
-		}
-		if h.payload.Len() > payloadLimit-3 {
-			if i == 0 && !h.hasTraces {
-				// This is the first span of the first trace, and it's too big.
-				h.payload.Truncate(startLen)
-				return 0, &encodingError{cause: errors.New("span too large for payload"), dropReason: "trace_too_large"}
+		h.encodeSpan(s)
+		if h.buf.Len() > logPayloadLimit-len(logPayloadSuffix) {
+			if i == 0 {
+				h.buf.Truncate(startn)
+				if !h.hasTraces {
+					// This is the first span of the first trace, and it's too big.
+					return 0, &encodingError{cause: errors.New("span too large for payload"), dropReason: "trace_too_large"}
+				}
+				return 0, nil
 			}
-			h.payload.Truncate(l)
+			h.buf.Truncate(n)
 			break
 		}
 		written++
 	}
-	h.payload.WriteString("]")
+	h.buf.WriteByte(']')
 	h.hasTraces = true
 	return written, nil
 }
 
-func (h *lambdaTraceWriter) add(trace []*span) {
+func (h *logTraceWriter) add(trace []*span) {
 	for len(trace) > 0 {
-		written, err := h.addTrace(trace)
+		n, err := h.writeTrace(trace)
 		if err != nil {
 			log.Error("lost a trace: %s", err.cause)
 			h.config.statsd.Count("datadog.tracer.traces_dropped", 1, []string{"reason:" + err.dropReason}, 1)
 			return
 		}
-		trace = trace[written:]
+		trace = trace[n:]
 		if len(trace) > 0 {
 			h.flush()
 		}
 	}
 }
 
-func (h *lambdaTraceWriter) stop() {}
+func (h *logTraceWriter) stop() {}
 
-// flush will push any currently buffered traces to the server.
-func (h *lambdaTraceWriter) flush() {
+// flush will write any buffered traces to standard output.
+func (h *logTraceWriter) flush() {
 	if !h.hasTraces {
 		return
 	}
-	h.payload.WriteString("]}\n")
-	os.Stdout.Write(h.payload.Bytes())
+	h.buf.WriteString(logPayloadSuffix)
+	h.w.Write(h.buf.Bytes())
 	h.resetPayload()
 }
